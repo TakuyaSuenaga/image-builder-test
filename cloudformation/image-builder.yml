@@ -1,0 +1,178 @@
+# cloudformation/image-builder.yml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Image Builder resources for automated AMI creation'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment name
+  
+  ProjectName:
+    Type: String
+    Default: my-project
+    Description: Project name for resource naming
+  
+  BaseImageArn:
+    Type: String
+    Default: arn:aws:imagebuilder:us-west-2:aws:image/ubuntu-server-24-lts-x86/x.x.x
+    Description: Base image ARN (Ubuntu 24.04 LTS)
+  
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    Description: EC2 instance type for image building
+  
+  HelloWorldComponentData:
+    Type: String
+    Description: Hello World component YAML content
+
+Resources:
+  # IAM Role for Image Builder
+  ImageBuilderInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-imagebuilder-instance-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/EC2InstanceProfileForImageBuilder
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  ImageBuilderInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref ImageBuilderInstanceRole
+
+  # Image Recipe
+  ImageRecipe:
+    Type: AWS::ImageBuilder::ImageRecipe
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-recipe'
+      Version: '1.0.0'
+      ParentImage: !Ref BaseImageArn
+      Components:
+        - ComponentArn: arn:aws:imagebuilder:us-west-2:aws:component/update-linux/x.x.x
+        - ComponentArn: !Ref HelloWorldComponent
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            DeleteOnTermination: true
+            VolumeSize: 20
+            VolumeType: gp3
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+
+  # Hello World Component
+  HelloWorldComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-helloworld-component'
+      Version: '1.0.0'
+      Platform: Linux
+      Data: !Ref HelloWorldComponentData
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+
+  # Infrastructure Configuration
+  InfrastructureConfiguration:
+    Type: AWS::ImageBuilder::InfrastructureConfiguration
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-infrastructure'
+      InstanceProfileName: !Ref ImageBuilderInstanceProfile
+      InstanceTypes:
+        - !Ref InstanceType
+      TerminateInstanceOnFailure: true
+      SnsTopicArn: !Ref SNSTopic
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+
+  # Distribution Configuration
+  DistributionConfiguration:
+    Type: AWS::ImageBuilder::DistributionConfiguration
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-distribution'
+      Distributions:
+        - Region: !Ref 'AWS::Region'
+          AmiDistributionConfiguration:
+            Name: !Sub '${ProjectName}-${Environment}-ami-{{ imagebuilder:buildDate }}'
+            Description: !Sub 'Custom AMI for ${ProjectName} ${Environment}'
+            AmiTags:
+              Environment: !Ref Environment
+              Project: !Ref ProjectName
+              CreatedBy: ImageBuilder
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+
+  # Image Pipeline
+  ImagePipeline:
+    Type: AWS::ImageBuilder::ImagePipeline
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-pipeline'
+      ImageRecipeArn: !Ref ImageRecipe
+      InfrastructureConfigurationArn: !Ref InfrastructureConfiguration
+      DistributionConfigurationArn: !Ref DistributionConfiguration
+      Status: ENABLED
+      Schedule:
+        ScheduleExpression: 'cron(0 2 * * sun)'  # Weekly on Sunday at 2 AM
+        PipelineExecutionStartCondition: EXPRESSION_MATCH_AND_DEPENDENCY_UPDATES_AVAILABLE
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+
+  # SNS Topic for notifications
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-imagebuilder-notifications'
+      DisplayName: Image Builder Notifications
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SNS Topic Policy
+  SNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref SNSTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: imagebuilder.amazonaws.com
+            Action:
+              - sns:Publish
+            Resource: !Ref SNSTopic
+
+Outputs:
+  ImagePipelineArn:
+    Description: ARN of the Image Pipeline
+    Value: !Ref ImagePipeline
+    Export:
+      Name: !Sub '${AWS::StackName}-ImagePipelineArn'
+
+  ImageRecipeArn:
+    Description: ARN of the Image Recipe
+    Value: !Ref ImageRecipe
+    Export:
+      Name: !Sub '${AWS::StackName}-ImageRecipeArn'
+
+  SNSTopicArn:
+    Description: ARN of the SNS Topic
+    Value: !Ref SNSTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'

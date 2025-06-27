@@ -1,0 +1,22 @@
+# recipes/ubuntu-base-recipe.yml
+name: UbuntuBaseRecipe
+description: Ubuntu 24.04 base recipe with custom components
+version: 1.0.0
+parentImage: ubuntu-server-24-lts-x86
+components:
+  - name: update-linux
+    parameters: []
+  - name: HelloWorldBuildDocument
+    parameters: []
+blockDeviceMappings:
+  - deviceName: /dev/sda1
+    ebs:
+      deleteOnTermination: true
+      volumeSize: 20
+      volumeType: gp3
+      encrypted: false
+workingDirectory: /tmp
+additionalInstanceConfiguration:
+  systemsManagerAgent:
+    uninstallAfterBuild: false
+  userDataOverride: ""

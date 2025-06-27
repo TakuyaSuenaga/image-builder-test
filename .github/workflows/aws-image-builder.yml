@@ -1,0 +1,91 @@
+# .github/workflows/aws-image-builder.yml
+name: AWS Image Builder with CloudFormation
+
+on:
+  # push:
+  #   branches: [ main, develop ]
+  # pull_request:
+  #   branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'deploy'
+        type: choice
+        options:
+        - deploy
+        - delete
+
+env:
+  AWS_REGION: us-west-2
+  STACK_NAME: image-builder-stack
+
+jobs:
+  deploy-image-builder:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+        aws-region: ${{ env.AWS_REGION }}
+        # Alternative: Use access keys instead of OIDC
+        # aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        # aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+    - name: Deploy CloudFormation Stack
+      if: github.event.inputs.action != 'delete'
+      run: |
+        # Read component file content
+        COMPONENT_CONTENT=$(cat components/hello-world.yml)
+        
+        aws cloudformation deploy \
+          --template-file cloudformation/image-builder.yml \
+          --stack-name ${{ env.STACK_NAME }} \
+          --parameter-overrides \
+            Environment=${{ github.ref_name }} \
+            ProjectName=my-image-builder \
+            HelloWorldComponentData="$COMPONENT_CONTENT" \
+          --capabilities CAPABILITY_IAM \
+          --region ${{ env.AWS_REGION }} \
+          --no-fail-on-empty-changeset
+
+    - name: Get Image Builder Pipeline ARN
+      if: github.event.inputs.action != 'delete'
+      id: get-pipeline
+      run: |
+        PIPELINE_ARN=$(aws cloudformation describe-stacks \
+          --stack-name ${{ env.STACK_NAME }} \
+          --query 'Stacks[0].Outputs[?OutputKey==`ImagePipelineArn`].OutputValue' \
+          --output text \
+          --region ${{ env.AWS_REGION }})
+        echo "pipeline-arn=$PIPELINE_ARN" >> $GITHUB_OUTPUT
+
+    - name: Start Image Pipeline Execution
+      if: github.event.inputs.action != 'delete'
+      run: |
+        EXECUTION_ID=$(aws imagebuilder start-image-pipeline-execution \
+          --image-pipeline-arn ${{ steps.get-pipeline.outputs.pipeline-arn }} \
+          --query 'imageBuildVersionArn' \
+          --output text \
+          --region ${{ env.AWS_REGION }})
+        echo "Image pipeline execution started: $EXECUTION_ID"
+
+    - name: Delete CloudFormation Stack
+      if: github.event.inputs.action == 'delete'
+      run: |
+        aws cloudformation delete-stack \
+          --stack-name ${{ env.STACK_NAME }} \
+          --region ${{ env.AWS_REGION }}
+        
+        aws cloudformation wait stack-delete-complete \
+          --stack-name ${{ env.STACK_NAME }} \
+          --region ${{ env.AWS_REGION }}
