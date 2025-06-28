@@ -1,0 +1,343 @@
+# .github/workflows/aws-image-builder-direct.yml
+name: AWS Image Builder Direct (No CloudFormation)
+
+on:
+  # push:
+  #   branches: [ main, develop ]
+  # pull_request:
+  #   branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'create'
+        type: choice
+        options:
+        - create
+        - delete
+        - execute
+
+env:
+  AWS_REGION: us-west-2
+  PROJECT_NAME: my-image-builder
+  BASE_IMAGE_ARN: arn:aws:imagebuilder:us-west-2:aws:image/ubuntu-server-24-lts-x86/x.x.x
+  INSTANCE_TYPE: t3.medium
+
+jobs:
+  manage-image-builder:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Set environment variables
+      run: |
+        echo "ENVIRONMENT=${{ github.ref_name }}" >> $GITHUB_ENV
+        echo "COMPONENT_NAME=${{ env.PROJECT_NAME }}-${{ github.ref_name }}-hello-world" >> $GITHUB_ENV
+        echo "RECIPE_NAME=${{ env.PROJECT_NAME }}-${{ github.ref_name }}-recipe" >> $GITHUB_ENV
+        echo "INFRASTRUCTURE_NAME=${{ env.PROJECT_NAME }}-${{ github.ref_name }}-infrastructure" >> $GITHUB_ENV
+        echo "DISTRIBUTION_NAME=${{ env.PROJECT_NAME }}-${{ github.ref_name }}-distribution" >> $GITHUB_ENV
+        echo "PIPELINE_NAME=${{ env.PROJECT_NAME }}-${{ github.ref_name }}-pipeline" >> $GITHUB_ENV
+        echo "INSTANCE_PROFILE_NAME=${{ env.PROJECT_NAME }}-${{ github.ref_name }}-instance-profile" >> $GITHUB_ENV
+        echo "IAM_ROLE_NAME=${{ env.PROJECT_NAME }}-${{ github.ref_name }}-instance-role" >> $GITHUB_ENV
+
+    - name: Create IAM Role for Image Builder
+      if: github.event.inputs.action != 'delete'
+      run: |
+        # Create IAM role
+        aws iam create-role \
+          --role-name ${{ env.IAM_ROLE_NAME }} \
+          --assume-role-policy-document '{
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": "ec2.amazonaws.com"
+                },
+                "Action": "sts:AssumeRole"
+              }
+            ]
+          }' \
+          --tags Key=Environment,Value=${{ env.ENVIRONMENT }} Key=Project,Value=${{ env.PROJECT_NAME }} \
+          --region ${{ env.AWS_REGION }} || echo "Role may already exist"
+        
+        # Attach managed policies
+        aws iam attach-role-policy \
+          --role-name ${{ env.IAM_ROLE_NAME }} \
+          --policy-arn arn:aws:iam::aws:policy/EC2InstanceProfileForImageBuilder \
+          --region ${{ env.AWS_REGION }} || true
+        
+        aws iam attach-role-policy \
+          --role-name ${{ env.IAM_ROLE_NAME }} \
+          --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore \
+          --region ${{ env.AWS_REGION }} || true
+        
+        # Create instance profile
+        aws iam create-instance-profile \
+          --instance-profile-name ${{ env.INSTANCE_PROFILE_NAME }} \
+          --tags Key=Environment,Value=${{ env.ENVIRONMENT }} Key=Project,Value=${{ env.PROJECT_NAME }} \
+          --region ${{ env.AWS_REGION }} || echo "Instance profile may already exist"
+        
+        # Add role to instance profile
+        aws iam add-role-to-instance-profile \
+          --instance-profile-name ${{ env.INSTANCE_PROFILE_NAME }} \
+          --role-name ${{ env.IAM_ROLE_NAME }} \
+          --region ${{ env.AWS_REGION }} || true
+
+    - name: Create Image Builder Component
+      if: github.event.inputs.action != 'delete'
+      run: |
+        # Read component data from file
+        COMPONENT_DATA=$(cat components/hello-world.yml)
+        
+        # Create component
+        aws imagebuilder create-component \
+          --name ${{ env.COMPONENT_NAME }} \
+          --semantic-version 1.0.0 \
+          --platform Linux \
+          --data "$COMPONENT_DATA" \
+          --tags Environment=${{ env.ENVIRONMENT }},Project=${{ env.PROJECT_NAME }} \
+          --region ${{ env.AWS_REGION }} || echo "Component may already exist"
+
+    - name: Get Component ARN
+      if: github.event.inputs.action != 'delete'
+      id: get-component
+      run: |
+        COMPONENT_ARN=$(aws imagebuilder list-components \
+          --owner Self \
+          --filters name=name,values=${{ env.COMPONENT_NAME }} \
+          --query 'componentVersionList[0].arn' \
+          --output text \
+          --region ${{ env.AWS_REGION }})
+        echo "component-arn=$COMPONENT_ARN" >> $GITHUB_OUTPUT
+        echo "Component ARN: $COMPONENT_ARN"
+
+    - name: Create Image Recipe
+      if: github.event.inputs.action != 'delete'
+      run: |
+        aws imagebuilder create-image-recipe \
+          --name ${{ env.RECIPE_NAME }} \
+          --semantic-version 1.0.0 \
+          --parent-image ${{ env.BASE_IMAGE_ARN }} \
+          --components componentArn=arn:aws:imagebuilder:${{ env.AWS_REGION }}:aws:component/update-linux/x.x.x componentArn=${{ steps.get-component.outputs.component-arn }} \
+          --block-device-mappings deviceName=/dev/sda1,ebs='{deleteOnTermination=true,volumeSize=20,volumeType=gp3}' \
+          --tags Environment=${{ env.ENVIRONMENT }},Project=${{ env.PROJECT_NAME }} \
+          --region ${{ env.AWS_REGION }} || echo "Recipe may already exist"
+
+    - name: Get Image Recipe ARN
+      if: github.event.inputs.action != 'delete'
+      id: get-recipe
+      run: |
+        RECIPE_ARN=$(aws imagebuilder list-image-recipes \
+          --owner Self \
+          --filters name=name,values=${{ env.RECIPE_NAME }} \
+          --query 'imageRecipeSummaryList[0].arn' \
+          --output text \
+          --region ${{ env.AWS_REGION }})
+        echo "recipe-arn=$RECIPE_ARN" >> $GITHUB_OUTPUT
+        echo "Recipe ARN: $RECIPE_ARN"
+
+    - name: Create Infrastructure Configuration
+      if: github.event.inputs.action != 'delete'
+      run: |
+        # Wait for instance profile to be ready
+        sleep 30
+        
+        aws imagebuilder create-infrastructure-configuration \
+          --name ${{ env.INFRASTRUCTURE_NAME }} \
+          --instance-profile-name ${{ env.INSTANCE_PROFILE_NAME }} \
+          --instance-types ${{ env.INSTANCE_TYPE }} \
+          --terminate-instance-on-failure \
+          --tags Environment=${{ env.ENVIRONMENT }},Project=${{ env.PROJECT_NAME }} \
+          --region ${{ env.AWS_REGION }} || echo "Infrastructure configuration may already exist"
+
+    - name: Get Infrastructure Configuration ARN
+      if: github.event.inputs.action != 'delete'
+      id: get-infrastructure
+      run: |
+        INFRASTRUCTURE_ARN=$(aws imagebuilder list-infrastructure-configurations \
+          --filters name=name,values=${{ env.INFRASTRUCTURE_NAME }} \
+          --query 'infrastructureConfigurationSummaryList[0].arn' \
+          --output text \
+          --region ${{ env.AWS_REGION }})
+        echo "infrastructure-arn=$INFRASTRUCTURE_ARN" >> $GITHUB_OUTPUT
+        echo "Infrastructure ARN: $INFRASTRUCTURE_ARN"
+
+    - name: Create Distribution Configuration
+      if: github.event.inputs.action != 'delete'
+      run: |
+        aws imagebuilder create-distribution-configuration \
+          --name ${{ env.DISTRIBUTION_NAME }} \
+          --distributions region=${{ env.AWS_REGION }},amiDistributionConfiguration='{name=${{ env.PROJECT_NAME }}-${{ env.ENVIRONMENT }}-ami-{{imagebuilder:buildDate}},description=Custom Ubuntu 24.04 AMI for ${{ env.PROJECT_NAME }} ${{ env.ENVIRONMENT }},amiTags={Environment=${{ env.ENVIRONMENT }},Project=${{ env.PROJECT_NAME }},CreatedBy=ImageBuilder}}' \
+          --tags Environment=${{ env.ENVIRONMENT }},Project=${{ env.PROJECT_NAME }} \
+          --region ${{ env.AWS_REGION }} || echo "Distribution configuration may already exist"
+
+    - name: Get Distribution Configuration ARN
+      if: github.event.inputs.action != 'delete'
+      id: get-distribution
+      run: |
+        DISTRIBUTION_ARN=$(aws imagebuilder list-distribution-configurations \
+          --filters name=name,values=${{ env.DISTRIBUTION_NAME }} \
+          --query 'distributionConfigurationSummaryList[0].arn' \
+          --output text \
+          --region ${{ env.AWS_REGION }})
+        echo "distribution-arn=$DISTRIBUTION_ARN" >> $GITHUB_OUTPUT
+        echo "Distribution ARN: $DISTRIBUTION_ARN"
+
+    - name: Create Image Pipeline
+      if: github.event.inputs.action != 'delete'
+      run: |
+        aws imagebuilder create-image-pipeline \
+          --name ${{ env.PIPELINE_NAME }} \
+          --image-recipe-arn ${{ steps.get-recipe.outputs.recipe-arn }} \
+          --infrastructure-configuration-arn ${{ steps.get-infrastructure.outputs.infrastructure-arn }} \
+          --distribution-configuration-arn ${{ steps.get-distribution.outputs.distribution-arn }} \
+          --status ENABLED \
+          --schedule scheduleExpression='cron(0 2 * * sun)',pipelineExecutionStartCondition=EXPRESSION_MATCH_AND_DEPENDENCY_UPDATES_AVAILABLE \
+          --tags Environment=${{ env.ENVIRONMENT }},Project=${{ env.PROJECT_NAME }} \
+          --region ${{ env.AWS_REGION }} || echo "Pipeline may already exist"
+
+    - name: Get Image Pipeline ARN
+      if: github.event.inputs.action != 'delete'
+      id: get-pipeline
+      run: |
+        PIPELINE_ARN=$(aws imagebuilder list-image-pipelines \
+          --filters name=name,values=${{ env.PIPELINE_NAME }} \
+          --query 'imagePipelineList[0].arn' \
+          --output text \
+          --region ${{ env.AWS_REGION }})
+        echo "pipeline-arn=$PIPELINE_ARN" >> $GITHUB_OUTPUT
+        echo "Pipeline ARN: $PIPELINE_ARN"
+
+    - name: Start Image Pipeline Execution
+      if: github.event.inputs.action == 'execute' || (github.event.inputs.action != 'delete' && github.event_name == 'push')
+      run: |
+        PIPELINE_ARN=${{ steps.get-pipeline.outputs.pipeline-arn }}
+        if [ "$PIPELINE_ARN" != "None" ] && [ -n "$PIPELINE_ARN" ]; then
+          EXECUTION_ID=$(aws imagebuilder start-image-pipeline-execution \
+            --image-pipeline-arn $PIPELINE_ARN \
+            --query 'imageBuildVersionArn' \
+            --output text \
+            --region ${{ env.AWS_REGION }})
+          echo "Image pipeline execution started: $EXECUTION_ID"
+        else
+          echo "Pipeline ARN not found, skipping execution"
+        fi
+
+    - name: Delete Image Builder Resources
+      if: github.event.inputs.action == 'delete'
+      run: |
+        # Delete pipeline
+        PIPELINE_ARN=$(aws imagebuilder list-image-pipelines \
+          --filters name=name,values=${{ env.PIPELINE_NAME }} \
+          --query 'imagePipelineList[0].arn' \
+          --output text \
+          --region ${{ env.AWS_REGION }})
+        if [ "$PIPELINE_ARN" != "None" ] && [ -n "$PIPELINE_ARN" ]; then
+          aws imagebuilder delete-image-pipeline \
+            --image-pipeline-arn $PIPELINE_ARN \
+            --region ${{ env.AWS_REGION }} || true
+          echo "Deleted pipeline: $PIPELINE_ARN"
+        fi
+        
+        # Delete distribution configuration
+        DISTRIBUTION_ARN=$(aws imagebuilder list-distribution-configurations \
+          --filters name=name,values=${{ env.DISTRIBUTION_NAME }} \
+          --query 'distributionConfigurationSummaryList[0].arn' \
+          --output text \
+          --region ${{ env.AWS_REGION }})
+        if [ "$DISTRIBUTION_ARN" != "None" ] && [ -n "$DISTRIBUTION_ARN" ]; then
+          aws imagebuilder delete-distribution-configuration \
+            --distribution-configuration-arn $DISTRIBUTION_ARN \
+            --region ${{ env.AWS_REGION }} || true
+          echo "Deleted distribution configuration: $DISTRIBUTION_ARN"
+        fi
+        
+        # Delete infrastructure configuration
+        INFRASTRUCTURE_ARN=$(aws imagebuilder list-infrastructure-configurations \
+          --filters name=name,values=${{ env.INFRASTRUCTURE_NAME }} \
+          --query 'infrastructureConfigurationSummaryList[0].arn' \
+          --output text \
+          --region ${{ env.AWS_REGION }})
+        if [ "$INFRASTRUCTURE_ARN" != "None" ] && [ -n "$INFRASTRUCTURE_ARN" ]; then
+          aws imagebuilder delete-infrastructure-configuration \
+            --infrastructure-configuration-arn $INFRASTRUCTURE_ARN \
+            --region ${{ env.AWS_REGION }} || true
+          echo "Deleted infrastructure configuration: $INFRASTRUCTURE_ARN"
+        fi
+        
+        # Delete image recipe
+        RECIPE_ARN=$(aws imagebuilder list-image-recipes \
+          --owner Self \
+          --filters name=name,values=${{ env.RECIPE_NAME }} \
+          --query 'imageRecipeSummaryList[0].arn' \
+          --output text \
+          --region ${{ env.AWS_REGION }})
+        if [ "$RECIPE_ARN" != "None" ] && [ -n "$RECIPE_ARN" ]; then
+          aws imagebuilder delete-image-recipe \
+            --image-recipe-arn $RECIPE_ARN \
+            --region ${{ env.AWS_REGION }} || true
+          echo "Deleted recipe: $RECIPE_ARN"
+        fi
+        
+        # Delete component
+        COMPONENT_ARN=$(aws imagebuilder list-components \
+          --owner Self \
+          --filters name=name,values=${{ env.COMPONENT_NAME }} \
+          --query 'componentVersionList[0].arn' \
+          --output text \
+          --region ${{ env.AWS_REGION }})
+        if [ "$COMPONENT_ARN" != "None" ] && [ -n "$COMPONENT_ARN" ]; then
+          aws imagebuilder delete-component \
+            --component-build-version-arn $COMPONENT_ARN \
+            --region ${{ env.AWS_REGION }} || true
+          echo "Deleted component: $COMPONENT_ARN"
+        fi
+        
+        # Delete IAM resources
+        aws iam remove-role-from-instance-profile \
+          --instance-profile-name ${{ env.INSTANCE_PROFILE_NAME }} \
+          --role-name ${{ env.IAM_ROLE_NAME }} \
+          --region ${{ env.AWS_REGION }} || true
+        
+        aws iam delete-instance-profile \
+          --instance-profile-name ${{ env.INSTANCE_PROFILE_NAME }} \
+          --region ${{ env.AWS_REGION }} || true
+        
+        aws iam detach-role-policy \
+          --role-name ${{ env.IAM_ROLE_NAME }} \
+          --policy-arn arn:aws:iam::aws:policy/EC2InstanceProfileForImageBuilder \
+          --region ${{ env.AWS_REGION }} || true
+        
+        aws iam detach-role-policy \
+          --role-name ${{ env.IAM_ROLE_NAME }} \
+          --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore \
+          --region ${{ env.AWS_REGION }} || true
+        
+        aws iam delete-role \
+          --role-name ${{ env.IAM_ROLE_NAME }} \
+          --region ${{ env.AWS_REGION }} || true
+        
+        echo "Cleanup completed"
+
+    - name: List Created Resources
+      if: github.event.inputs.action != 'delete'
+      run: |
+        echo "=== Created Resources ==="
+        echo "Component ARN: ${{ steps.get-component.outputs.component-arn }}"
+        echo "Recipe ARN: ${{ steps.get-recipe.outputs.recipe-arn }}"
+        echo "Infrastructure ARN: ${{ steps.get-infrastructure.outputs.infrastructure-arn }}"
+        echo "Distribution ARN: ${{ steps.get-distribution.outputs.distribution-arn }}"
+        echo "Pipeline ARN: ${{ steps.get-pipeline.outputs.pipeline-arn }}"

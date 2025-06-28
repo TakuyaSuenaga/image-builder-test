@@ -1,0 +1,836 @@
+# Workbench AMI Repository Files
+
+## Repository Structure
+```
+workbench-ami-{project-name}/
+├── .github/
+│   └── workflows/
+│       └── build-ami.yml
+├── components/
+│   ├── cmake-install.yml
+│   ├── aws-cli-install.yml
+│   ├── development-tools.yml
+│   ├── ide-setup.yml
+│   └── custom-software.yml
+├── recipes/
+│   └── workbench-recipe.yml
+├── config/
+│   ├── infrastructure-config.yml
+│   ├── distribution-config.yml
+│   └── image-pipeline.yml
+├── tests/
+│   └── validation-test.yml
+├── docs/
+│   └── README.md
+├── catalog-info.yaml
+└── .gitignore
+```
+
+## File Contents
+
+### .github/workflows/build-ami.yml
+```yaml
+name: Build Workbench AMI
+
+on:
+  push:
+    branches: [main, develop]
+    paths: 
+      - 'components/**'
+      - 'recipes/**'
+      - 'config/**'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force AMI build'
+        required: false
+        default: false
+
+env:
+  AWS_REGION: us-east-1
+  AMI_NAME_PREFIX: workbench-ami
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate YAML files
+        run: |
+          find . -name "*.yml" -o -name "*.yaml" | xargs -I {} sh -c 'echo "Validating {}" && yamllint {}'
+
+      - name: Validate Image Builder components
+        run: |
+          for component in components/*.yml; do
+            echo "Validating component: $component"
+            aws imagebuilder validate-component-document --data file://$component
+          done
+
+  build-ami:
+    needs: validate
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.event.inputs.force_build == 'true'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set build variables
+        id: vars
+        run: |
+          echo "TIMESTAMP=$(date +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
+          echo "SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+          echo "VERSION=1.0.${{ github.run_number }}" >> $GITHUB_OUTPUT
+
+      - name: Create/Update components
+        run: |
+          for component_file in components/*.yml; do
+            component_name=$(basename "$component_file" .yml)
+            echo "Processing component: $component_name"
+            
+            # Check if component exists
+            if aws imagebuilder get-component --component-build-version-arn "arn:aws:imagebuilder:${{ env.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:component/$component_name/1.0.0" 2>/dev/null; then
+              echo "Component $component_name exists, creating new version"
+              aws imagebuilder create-component \
+                --name "$component_name" \
+                --semantic-version "${{ steps.vars.outputs.VERSION }}" \
+                --platform Linux \
+                --data file://$component_file \
+                --tags "Project=${{ github.event.repository.name }}" "Environment=production" "ManagedBy=GitHubActions"
+            else
+              echo "Creating new component: $component_name"
+              aws imagebuilder create-component \
+                --name "$component_name" \
+                --semantic-version "1.0.0" \
+                --platform Linux \
+                --data file://$component_file \
+                --tags "Project=${{ github.event.repository.name }}" "Environment=production" "ManagedBy=GitHubActions"
+            fi
+          done
+
+      - name: Create/Update recipe
+        run: |
+          recipe_name="${{ github.event.repository.name }}-recipe"
+          aws imagebuilder create-image-recipe \
+            --cli-input-yaml file://recipes/workbench-recipe.yml \
+            --tags "Project=${{ github.event.repository.name }}" "Environment=production" "Version=${{ steps.vars.outputs.VERSION }}"
+
+      - name: Create/Update infrastructure configuration
+        run: |
+          aws imagebuilder create-infrastructure-configuration \
+            --cli-input-yaml file://config/infrastructure-config.yml
+
+      - name: Create/Update distribution configuration
+        run: |
+          aws imagebuilder create-distribution-configuration \
+            --cli-input-yaml file://config/distribution-config.yml
+
+      - name: Start AMI build
+        id: build
+        run: |
+          pipeline_arn=$(aws imagebuilder create-image-pipeline \
+            --cli-input-yaml file://config/image-pipeline.yml \
+            --query 'imagePipelineArn' --output text)
+          
+          execution_id=$(aws imagebuilder start-image-pipeline-execution \
+            --image-pipeline-arn "$pipeline_arn" \
+            --query 'requestId' --output text)
+          
+          echo "EXECUTION_ID=$execution_id" >> $GITHUB_OUTPUT
+          echo "PIPELINE_ARN=$pipeline_arn" >> $GITHUB_OUTPUT
+
+      - name: Wait for AMI build completion
+        run: |
+          echo "Waiting for AMI build to complete..."
+          timeout 3600 bash -c '
+            while true; do
+              status=$(aws imagebuilder get-image --image-build-version-arn "${{ steps.build.outputs.PIPELINE_ARN }}" --query "image.state.status" --output text 2>/dev/null || echo "BUILDING")
+              echo "Current status: $status"
+              
+              if [ "$status" = "AVAILABLE" ]; then
+                echo "AMI build completed successfully!"
+                break
+              elif [ "$status" = "FAILED" ] || [ "$status" = "CANCELLED" ]; then
+                echo "AMI build failed with status: $status"
+                exit 1
+              fi
+              
+              sleep 30
+            done
+          '
+
+      - name: Get AMI details
+        id: ami
+        run: |
+          ami_id=$(aws imagebuilder get-image \
+            --image-build-version-arn "${{ steps.build.outputs.PIPELINE_ARN }}" \
+            --query 'image.outputResources.amis[0].image' --output text)
+          
+          echo "AMI_ID=$ami_id" >> $GITHUB_OUTPUT
+          echo "Built AMI: $ami_id"
+
+      - name: Update README with AMI info
+        run: |
+          sed -i "s/AMI_ID_PLACEHOLDER/${{ steps.ami.outputs.AMI_ID }}/g" docs/README.md
+          sed -i "s/BUILD_DATE_PLACEHOLDER/$(date -u +%Y-%m-%d)/g" docs/README.md
+
+      - name: Commit updated README
+        if: steps.ami.outputs.AMI_ID != ''
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add docs/README.md
+          git commit -m "Update README with new AMI ID: ${{ steps.ami.outputs.AMI_ID }}" || exit 0
+          git push
+```
+
+### components/cmake-install.yml
+```yaml
+name: CMake Installation
+description: Install CMake build system
+schemaVersion: 1.0
+
+phases:
+  - name: build
+    steps:
+      - name: DownloadCMake
+        action: WebDownload
+        timeoutSeconds: 300
+        inputs:
+          - source: https://github.com/Kitware/CMake/releases/download/v3.28.1/cmake-3.28.1-linux-x86_64.tar.gz
+            destination: /tmp/cmake.tar.gz
+            checksum: 15e94f83e647f7d620a140a7218e8c0f714c8ac69fdfce85e2a7c4dfeef90084
+            checksumType: sha256
+
+      - name: ExtractCMake
+        action: ExecuteBash
+        inputs:
+          commands:
+            - cd /tmp
+            - tar -xzf cmake.tar.gz
+            - sudo mv cmake-3.28.1-linux-x86_64 /opt/cmake
+            - sudo ln -sf /opt/cmake/bin/* /usr/local/bin/
+
+      - name: VerifyInstallation
+        action: ExecuteBash
+        inputs:
+          commands:
+            - cmake --version
+            - which cmake
+
+      - name: CleanupDownload
+        action: ExecuteBash
+        inputs:
+          commands:
+            - rm -f /tmp/cmake.tar.gz
+
+  - name: validate
+    steps:
+      - name: TestCMake
+        action: ExecuteBash
+        inputs:
+          commands:
+            - cmake --version | grep -q "3.28.1"
+            - test -x /usr/local/bin/cmake
+```
+
+### components/aws-cli-install.yml
+```yaml
+name: AWS CLI Installation
+description: Install AWS CLI v2 and configure basic settings
+schemaVersion: 1.0
+
+phases:
+  - name: build
+    steps:
+      - name: DownloadAWSCLI
+        action: WebDownload
+        timeoutSeconds: 300
+        inputs:
+          - source: https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+            destination: /tmp/awscliv2.zip
+
+      - name: InstallAWSCLI
+        action: ExecuteBash
+        inputs:
+          commands:
+            - cd /tmp
+            - unzip -q awscliv2.zip
+            - sudo ./aws/install
+            - rm -rf /tmp/aws /tmp/awscliv2.zip
+
+      - name: ConfigureAWSCLI
+        action: ExecuteBash
+        inputs:
+          commands:
+            - aws configure set region us-east-1
+            - aws configure set output json
+            - aws configure set cli_pager ""
+
+      - name: InstallSessionManagerPlugin
+        action: ExecuteBash
+        inputs:
+          commands:
+            - curl -sS "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/linux_64bit/session-manager-plugin.rpm" -o /tmp/session-manager-plugin.rpm
+            - sudo yum install -y /tmp/session-manager-plugin.rpm
+            - rm -f /tmp/session-manager-plugin.rpm
+
+  - name: validate
+    steps:
+      - name: TestAWSCLI
+        action: ExecuteBash
+        inputs:
+          commands:
+            - aws --version
+            - session-manager-plugin --version
+            - test -x /usr/local/bin/aws
+```
+
+### components/development-tools.yml
+```yaml
+name: Development Tools
+description: Install essential development tools and libraries
+schemaVersion: 1.0
+
+phases:
+  - name: build
+    steps:
+      - name: UpdateSystem
+        action: ExecuteBash
+        inputs:
+          commands:
+            - sudo yum update -y
+
+      - name: InstallDevelopmentTools
+        action: ExecuteBash
+        inputs:
+          commands:
+            - sudo yum groupinstall -y "Development Tools"
+            - sudo yum install -y \
+                git \
+                wget \
+                curl \
+                vim \
+                nano \
+                htop \
+                tree \
+                jq \
+                unzip \
+                zip \
+                tar \
+                gzip
+
+      - name: InstallCompilers
+        action: ExecuteBash
+        inputs:
+          commands:
+            - sudo yum install -y \
+                gcc \
+                gcc-c++ \
+                make \
+                autoconf \
+                automake \
+                libtool \
+                pkgconfig
+
+      - name: InstallPython
+        action: ExecuteBash
+        inputs:
+          commands:
+            - sudo yum install -y python3 python3-pip python3-devel
+            - pip3 install --user \
+                awscli \
+                boto3 \
+                requests \
+                pyyaml \
+                jinja2
+
+      - name: InstallNode
+        action: ExecuteBash
+        inputs:
+          commands:
+            - curl -fsSL https://rpm.nodesource.com/setup_lts.x | sudo bash -
+            - sudo yum install -y nodejs
+            - npm install -g aws-cdk typescript
+
+      - name: InstallDocker
+        action: ExecuteBash
+        inputs:
+          commands:
+            - sudo yum install -y docker
+            - sudo systemctl enable docker
+            - sudo usermod -aG docker ec2-user
+
+  - name: validate
+    steps:
+      - name: ValidateTools
+        action: ExecuteBash
+        inputs:
+          commands:
+            - gcc --version
+            - python3 --version
+            - node --version
+            - npm --version
+            - docker --version
+            - git --version
+```
+
+### components/ide-setup.yml
+```yaml
+name: IDE Setup
+description: Install and configure development IDEs
+schemaVersion: 1.0
+
+phases:
+  - name: build
+    steps:
+      - name: InstallVSCode
+        action: ExecuteBash
+        inputs:
+          commands:
+            - sudo rpm --import https://packages.microsoft.com/keys/microsoft.asc
+            - sudo sh -c 'echo -e "[code]\nname=Visual Studio Code\nbaseurl=https://packages.microsoft.com/yumrepos/vscode\nenabled=1\ngpgcheck=1\ngpgkey=https://packages.microsoft.com/keys/microsoft.asc" > /etc/yum.repos.d/vscode.repo'
+            - sudo yum check-update
+            - sudo yum install -y code
+
+      - name: InstallVSCodeExtensions
+        action: ExecuteBash
+        inputs:
+          commands:
+            - sudo -u ec2-user code --install-extension ms-vscode.cpptools
+            - sudo -u ec2-user code --install-extension ms-python.python
+            - sudo -u ec2-user code --install-extension amazonwebservices.aws-toolkit-vscode
+            - sudo -u ec2-user code --install-extension ms-vscode.cmake-tools
+
+      - name: InstallVim
+        action: ExecuteBash
+        inputs:
+          commands:
+            - sudo yum install -y vim-enhanced
+            - sudo -u ec2-user git clone https://github.com/VundleVim/Vundle.vim.git /home/ec2-user/.vim/bundle/Vundle.vim
+
+      - name: ConfigureVim
+        action: CreateFile
+        inputs:
+          - path: /home/ec2-user/.vimrc
+            content: |
+              set nocompatible
+              filetype off
+              set rtp+=~/.vim/bundle/Vundle.vim
+              call vundle#begin()
+              Plugin 'VundleVim/Vundle.vim'
+              Plugin 'tpope/vim-fugitive'
+              Plugin 'scrooloose/nerdtree'
+              call vundle#end()
+              filetype plugin indent on
+              syntax on
+              set number
+              set tabstop=4
+              set shiftwidth=4
+              set expandtab
+              set autoindent
+              set smartindent
+            owner: ec2-user:ec2-user
+
+  - name: validate
+    steps:
+      - name: ValidateIDE
+        action: ExecuteBash
+        inputs:
+          commands:
+            - code --version
+            - vim --version
+            - test -f /home/ec2-user/.vimrc
+```
+
+### components/custom-software.yml
+```yaml
+name: Custom Software
+description: Install project-specific software and configurations
+schemaVersion: 1.0
+
+parameters:
+  - CustomPackages:
+      type: string
+      default: ""
+      description: Additional packages to install (space-separated)
+
+phases:
+  - name: build
+    steps:
+      - name: InstallCustomPackages
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              if [ -n "{{ CustomPackages }}" ]; then
+                sudo yum install -y {{ CustomPackages }}
+              fi
+
+      - name: SetupWorkspaceDirectory
+        action: ExecuteBash
+        inputs:
+          commands:
+            - sudo mkdir -p /workspace
+            - sudo chown ec2-user:ec2-user /workspace
+            - sudo chmod 755 /workspace
+
+      - name: CreateAliases
+        action: CreateFile
+        inputs:
+          - path: /home/ec2-user/.bash_aliases
+            content: |
+              alias ll='ls -alF'
+              alias la='ls -A'
+              alias l='ls -CF'
+              alias workspace='cd /workspace'
+              alias awslogin='aws sso login'
+              alias k='kubectl'
+            owner: ec2-user:ec2-user
+
+      - name: UpdateBashProfile
+        action: ExecuteBash
+        inputs:
+          commands:
+            - echo 'source ~/.bash_aliases' >> /home/ec2-user/.bashrc
+            - echo 'export PATH=$PATH:/usr/local/bin' >> /home/ec2-user/.bashrc
+            - echo 'cd /workspace' >> /home/ec2-user/.bashrc
+
+  - name: validate
+    steps:
+      - name: ValidateCustomSetup
+        action: ExecuteBash
+        inputs:
+          commands:
+            - test -d /workspace
+            - test -f /home/ec2-user/.bash_aliases
+            - grep -q "source ~/.bash_aliases" /home/ec2-user/.bashrc
+```
+
+### recipes/workbench-recipe.yml
+```yaml
+name: workbench-ami-recipe
+description: Recipe for building workbench AMI with development tools
+semanticVersion: 1.0.0
+parentImage: arn:aws:imagebuilder:us-east-1:123456789012:image/intermediate-ami/1.0.0
+
+components:
+  - componentArn: arn:aws:imagebuilder:us-east-1:123456789012:component/cmake-install/1.0.0
+  - componentArn: arn:aws:imagebuilder:us-east-1:123456789012:component/aws-cli-install/1.0.0
+  - componentArn: arn:aws:imagebuilder:us-east-1:123456789012:component/development-tools/1.0.0
+  - componentArn: arn:aws:imagebuilder:us-east-1:123456789012:component/ide-setup/1.0.0
+  - componentArn: arn:aws:imagebuilder:us-east-1:123456789012:component/custom-software/1.0.0
+    parameters:
+      - name: CustomPackages
+        value: htop tree ncdu
+
+blockDeviceMappings:
+  - deviceName: /dev/xvda
+    ebs:
+      deleteOnTermination: true
+      volumeSize: 50
+      volumeType: gp3
+      encrypted: true
+
+workingDirectory: /tmp
+
+additionalInstanceConfiguration:
+  systemsManagerAgent:
+    uninstallAfterBuild: false
+  userDataOverride: |
+    #!/bin/bash
+    echo "Starting workbench AMI customization..."
+    /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region}
+```
+
+### config/infrastructure-config.yml
+```yaml
+name: workbench-infrastructure-config
+description: Infrastructure configuration for workbench AMI builds
+instanceProfileName: EC2ImageBuilderInstanceProfile
+instanceTypes:
+  - m5.large
+  - m5.xlarge
+
+subnetId: subnet-12345678
+securityGroupIds:
+  - sg-87654321
+
+keyPair: my-key-pair
+
+logging:
+  s3Logs:
+    s3BucketName: my-imagebuilder-logs
+    s3KeyPrefix: workbench-builds/
+
+resourceTags:
+  Environment: production
+  Project: workbench-ami
+  Owner: platform-team
+  CostCenter: engineering
+
+terminateInstanceOnFailure: true
+```
+
+### config/distribution-config.yml
+```yaml
+name: workbench-distribution-config
+description: Distribution configuration for workbench AMI
+
+distributions:
+  - region: us-east-1
+    amiDistributionConfiguration:
+      name: "workbench-ami-{{ imagebuilder:buildDate }}"
+      description: "Workbench AMI built on {{ imagebuilder:buildDate }}"
+      amiTags:
+        Name: "workbench-ami-{{ imagebuilder:buildDate }}"
+        BuildDate: "{{ imagebuilder:buildDate }}"
+        Source: "{{ imagebuilder:buildVersion }}"
+        Environment: production
+        Project: workbench-ami
+        
+      targetAccountIds:
+        - "123456789012"
+        - "210987654321"
+
+  - region: us-west-2
+    amiDistributionConfiguration:
+      name: "workbench-ami-{{ imagebuilder:buildDate }}"
+      description: "Workbench AMI built on {{ imagebuilder:buildDate }}"
+      amiTags:
+        Name: "workbench-ami-{{ imagebuilder:buildDate }}"
+        BuildDate: "{{ imagebuilder:buildDate }}"
+        Source: "{{ imagebuilder:buildVersion }}"
+        Environment: production
+        Project: workbench-ami
+
+      targetAccountIds:
+        - "123456789012"
+```
+
+### config/image-pipeline.yml
+```yaml
+name: workbench-ami-pipeline
+description: Image pipeline for automated workbench AMI builds
+imageRecipeArn: arn:aws:imagebuilder:us-east-1:123456789012:image-recipe/workbench-ami-recipe/1.0.0
+infrastructureConfigurationArn: arn:aws:imagebuilder:us-east-1:123456789012:infrastructure-configuration/workbench-infrastructure-config
+distributionConfigurationArn: arn:aws:imagebuilder:us-east-1:123456789012:distribution-configuration/workbench-distribution-config
+
+imageTestsConfiguration:
+  imageTestsEnabled: true
+  timeoutMinutes: 120
+
+schedule:
+  scheduleExpression: "cron(0 2 ? * SUN *)"
+  pipelineExecutionStartCondition: "EXPRESSION_MATCH_AND_DEPENDENCY_UPDATES_AVAILABLE"
+
+status: ENABLED
+
+enhancedImageMetadataEnabled: true
+
+tags:
+  Environment: production
+  Project: workbench-ami
+  Pipeline: automated
+```
+
+### tests/validation-test.yml
+```yaml
+name: Workbench Validation Tests
+description: Validation tests for workbench AMI
+schemaVersion: 1.0
+
+phases:
+  - name: test
+    steps:
+      - name: TestCMake
+        action: ExecuteBash
+        inputs:
+          commands:
+            - cmake --version
+            - test -x /usr/local/bin/cmake
+
+      - name: TestAWSCLI
+        action: ExecuteBash
+        inputs:
+          commands:
+            - aws --version
+            - aws configure list
+
+      - name: TestDevelopmentTools
+        action: ExecuteBash
+        inputs:
+          commands:
+            - gcc --version
+            - python3 --version
+            - node --version
+            - docker --version
+
+      - name: TestIDE
+        action: ExecuteBash
+        inputs:
+          commands:
+            - code --version
+            - vim --version
+
+      - name: TestWorkspaceSetup
+        action: ExecuteBash
+        inputs:
+          commands:
+            - test -d /workspace
+            - test -f /home/ec2-user/.bash_aliases
+            - test -w /workspace
+
+      - name: TestServices
+        action: ExecuteBash
+        inputs:
+          commands:
+            - systemctl is-enabled docker
+```
+
+### catalog-info.yaml
+```yaml
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: workbench-ami
+  description: Workbench AMI with development tools
+  tags:
+    - ami
+    - aws
+    - development
+    - workbench
+  annotations:
+    github.com/project-slug: myorg/workbench-ami-project
+    aws.amazon.com/image-builder-pipeline: workbench-ami-pipeline
+spec:
+  type: infrastructure
+  lifecycle: production
+  owner: platform-team
+  system: development-platform
+  dependsOn:
+    - resource:intermediate-ami
+  providesApis:
+    - ami-distribution-api
+  consumesApis:
+    - aws-imagebuilder-api
+```
+
+### docs/README.md
+```markdown
+# Workbench AMI
+
+This repository contains the AWS Image Builder configuration for building workbench AMIs with development tools.
+
+## Latest AMI Information
+
+- **AMI ID**: AMI_ID_PLACEHOLDER
+- **Build Date**: BUILD_DATE_PLACEHOLDER
+- **Region**: us-east-1
+
+## Included Software
+
+### Development Tools
+- CMake 3.28.1
+- AWS CLI v2
+- GCC/G++ compiler suite
+- Python 3 with pip
+- Node.js with npm
+- Docker
+
+### IDEs and Editors
+- Visual Studio Code with extensions:
+  - C/C++ Tools
+  - Python
+  - AWS Toolkit
+  - CMake Tools
+- Vim with enhanced configuration
+
+### Additional Utilities
+- Git
+- htop, tree, ncdu
+- Various system utilities
+
+## Usage
+
+1. Launch an EC2 instance using the latest AMI ID
+2. Connect via SSH or Session Manager
+3. Start developing in the `/workspace` directory
+
+## Custom Configuration
+
+To modify the AMI configuration:
+
+1. Update the relevant YAML files in `components/` or `recipes/`
+2. Commit and push changes to the main branch
+3. GitHub Actions will automatically build a new AMI
+
+## Build Process
+
+The AMI build process is automated through GitHub Actions and includes:
+
+1. Validation of YAML files
+2. Component creation/update in AWS Image Builder
+3. Recipe and pipeline configuration
+4. AMI build execution
+5. Distribution to target accounts and regions
+
+## Testing
+
+Run validation tests locally:
+```bash
+yamllint components/*.yml recipes/*.yml config/*.yml
+```
+
+## Support
+
+For issues or questions, please contact the platform team or create an issue in this repository.
+```
+
+### .gitignore
+```
+# AWS credentials
+.aws/
+*.pem
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/
+
+# Logs
+*.log
+logs/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+build/
+dist/
+*.zip
+*.tar.gz
+```

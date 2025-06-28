@@ -1,0 +1,20 @@
+# components/docker-install/1.0.0.yml
+name: DockerInstallComponent
+description: Install Docker on Ubuntu
+schemaVersion: 1.0
+phases:
+  - name: build
+    steps:
+      - name: UpdatePackages
+        action: ExecuteBash
+        inputs:
+          commands:
+            - apt-get update
+      - name: InstallDocker
+        action: ExecuteBash
+        inputs:
+          commands:
+            - apt-get install -y docker.io
+            - systemctl enable docker
+            - systemctl start docker
+            - usermod -aG docker ubuntu
